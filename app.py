@@ -1,5 +1,5 @@
 """
-Rosreestr2Coord API Server v3.1.0
+Rosreestr2Coord API Server v3.1.1
 Полная информация о земельных участках и ОКС по кадастровому номеру
 + Список объектов в кадастровом квартале
 """
@@ -17,13 +17,17 @@ import os
 import time
 import requests
 import re
+import urllib3
 
 from rosreestr2coord.parser import Area
+
+# Отключаем предупреждения SSL (ПКК использует российские сертификаты)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI(
     title="Rosreestr2Coord API",
     description="API для получения полной информации об объектах недвижимости по кадастровому номеру",
-    version="3.1.0"
+    version="3.1.1"
 )
 
 # CORS
@@ -382,7 +386,8 @@ def get_objects_in_quarter(
             "Referer": "https://pkk.rosreestr.ru/"
         }
 
-        response = requests.get(url, params=params, headers=headers, timeout=30)
+        # verify=False для российских SSL-сертификатов
+        response = requests.get(url, params=params, headers=headers, timeout=30, verify=False)
         response.raise_for_status()
         data = response.json()
 
@@ -560,7 +565,7 @@ async def root():
     return {
         "status": "ok",
         "service": "rosreestr2coord-api",
-        "version": "3.1.0",
+        "version": "3.1.1",
         "features": [
             "Полная информация об объектах недвижимости",
             "Все типы объектов НСПД (1, 2, 4, 5, 7, 15)",
@@ -568,7 +573,7 @@ async def root():
             "KML экспорт",
             "Кэширование (TTL 1 час)",
             "GeoJSON координаты",
-            "Список объектов в кадастровом квартале (NEW!)"
+            "Список объектов в кадастровом квартале"
         ],
         "cache_size": len(CACHE)
     }
@@ -660,7 +665,7 @@ async def get_cadastral_oks(
     }
 
 
-# === НОВЫЙ ЭНДПОИНТ: Список объектов в квартале ===
+# === ЭНДПОИНТ: Список объектов в квартале ===
 @app.get("/api/quarter/{quarter_cn}/objects")
 async def get_quarter_objects(
     quarter_cn: str,
