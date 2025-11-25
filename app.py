@@ -1,8 +1,8 @@
 """
-Rosreestr2Coord API Server v3.2.0
+Rosreestr2Coord API Server v3.2.1
 Полная информация о земельных участках и ОКС по кадастровому номеру
 + Список объектов в кадастровом квартале (через НСПД)
-+ Список кварталов в кадастровом районе (через PKK)
++ Сканирование кварталов в кадастровом районе
 """
 
 from fastapi import FastAPI, HTTPException, Header, Query, Response
@@ -28,7 +28,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = FastAPI(
     title="Rosreestr2Coord API",
     description="API для получения полной информации об объектах недвижимости по кадастровому номеру",
-    version="3.2.0"
+    version="3.2.1"
 )
 
 # CORS
@@ -42,12 +42,6 @@ app.add_middleware(
 
 # Авторизация
 API_TOKEN = os.environ.get("API_TOKEN", "rr2c_api_7f8a9b3c4d5e6f")
-
-# НСПД API URL (публичный геокодер)
-NSPD_SEARCH_URL = "https://nspd.gov.ru/api/geoportal/v2/search/geoportal"
-
-# PKK API URL
-PKK_API_URL = "https://pkk.rosreestr.ru/api/features"
 
 # Типы объектов в НСПД (обновлённые)
 AREA_TYPES = {
@@ -331,90 +325,125 @@ def extract_settlement_from_address(address: str) -> Optional[str]:
     return None
 
 
-# === ФУНКЦИЯ ПОЛУЧЕНИЯ КВАРТАЛОВ В РАЙОНЕ (через PKK) ===
-def get_quarters_in_district(district_cn: str, limit: int = 100) -> dict:
+# === ФУНКЦИЯ СКАНИРОВАНИЯ КВАРТАЛОВ В РАЙОНЕ ===
+def scan_quarters_in_district(
+    district_cn: str,
+    max_quarters: int = 100,
+    zones: List[str] = None
+) -> dict:
     """
-    Получить список кадастровых кварталов в районе через PKK API
-
-    district_cn: кадастровый номер района (например: 12:05)
+    Сканирует кварталы в районе путём перебора возможных номеров.
+    
+    Формат кадастрового квартала: XX:XX:XXYYZZZZ
+    где XX:XX - район, XXYY - зона, ZZZZ - номер в зоне (обычно 001)
+    
+    Стандартные зоны: 01-15 для первой части, 01-10 для второй
     """
-
-    # Валидация формата
+    
+    # Валидация формата района
     if not re.match(r'^\d{2}:\d{2}$', district_cn):
         return {
             "success": False,
             "error": f"Неверный формат кадастрового района: {district_cn}. Ожидается формат XX:XX"
         }
-
-    try:
-        # PKK API для кварталов (тип 2)
-        url = f"{PKK_API_URL}/2"
-        params = {
-            "text": district_cn,
-            "limit": limit,
-            "tolerance": 4
-        }
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Referer": "https://pkk.rosreestr.ru/"
-        }
-
-        response = requests.get(url, params=params, headers=headers, timeout=30, verify=False)
-        response.raise_for_status()
-
-        data = response.json()
-
-        if not data.get("features"):
-            return {
-                "success": True,
-                "district": district_cn,
-                "quarters": [],
-                "count": 0,
-                "note": "Кварталы не найдены или PKK недоступен"
-            }
-
-        quarters = []
-        for feature in data["features"]:
-            attrs = feature.get("attrs", {})
-            quarter_cn = attrs.get("id", "")
-
-            # Проверяем что квартал принадлежит нужному району
-            if quarter_cn.startswith(district_cn + ":"):
-                quarters.append({
+    
+    # Если зоны не указаны, сканируем стандартные
+    if zones is None:
+        zones = []
+        # Генерируем возможные зоны: 0101, 0102, ..., 0201, 0202, ... до 1510
+        for z1 in range(1, 16):  # 01-15
+            for z2 in range(1, 11):  # 01-10
+                zones.append(f"{z1:02d}{z2:02d}")
+    
+    found_quarters = []
+    scanned = 0
+    empty_zones = 0
+    max_empty_zones = 30  # Останавливаемся после 30 пустых зон подряд
+    
+    for zone in zones:
+        if len(found_quarters) >= max_quarters:
+            break
+        if empty_zones >= max_empty_zones:
+            break
+            
+        # Пробуем номер 001 в этой зоне
+        quarter_cn = f"{district_cn}:{zone}001"
+        scanned += 1
+        
+        try:
+            area = Area(
+                code=quarter_cn,
+                area_type=2,
+                with_log=False,
+                timeout=10
+            )
+            
+            if area.feature:
+                props = area.feature.get("properties", {})
+                options = props.get("options", {})
+                geometry = area.feature.get("geometry", {})
+                center = extract_center(geometry)
+                
+                quarter_info = {
                     "cn": quarter_cn,
-                    "name": attrs.get("name", ""),
-                    "center": feature.get("center", {}),
-                    "extent": feature.get("extent", {})
-                })
-
-        return {
-            "success": True,
-            "district": district_cn,
-            "quarters": quarters,
-            "count": len(quarters),
-            "total_from_pkk": len(data["features"])
-        }
-
-    except requests.exceptions.Timeout:
-        return {
-            "success": False,
-            "district": district_cn,
-            "error": "Таймаут при запросе к PKK API"
-        }
-    except requests.exceptions.RequestException as e:
-        return {
-            "success": False,
-            "district": district_cn,
-            "error": f"Ошибка HTTP запроса: {str(e)}"
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "district": district_cn,
-            "error": str(e)
-        }
+                    "name": options.get("obj_label", quarter_cn),
+                    "area_sqm": options.get("sum_land_area"),
+                    "land_plots": options.get("cnt_land", 0),
+                    "center": center,
+                    "has_geometry": geometry is not None
+                }
+                
+                found_quarters.append(quarter_info)
+                empty_zones = 0  # Сбрасываем счётчик пустых зон
+                
+                # Проверяем 002, 003 и т.д. в этой зоне
+                for sub_num in range(2, 10):
+                    sub_quarter_cn = f"{district_cn}:{zone}{sub_num:03d}"
+                    scanned += 1
+                    
+                    try:
+                        sub_area = Area(
+                            code=sub_quarter_cn,
+                            area_type=2,
+                            with_log=False,
+                            timeout=10
+                        )
+                        
+                        if sub_area.feature:
+                            sub_props = sub_area.feature.get("properties", {})
+                            sub_options = sub_props.get("options", {})
+                            sub_geometry = sub_area.feature.get("geometry", {})
+                            sub_center = extract_center(sub_geometry)
+                            
+                            found_quarters.append({
+                                "cn": sub_quarter_cn,
+                                "name": sub_options.get("obj_label", sub_quarter_cn),
+                                "area_sqm": sub_options.get("sum_land_area"),
+                                "land_plots": sub_options.get("cnt_land", 0),
+                                "center": sub_center,
+                                "has_geometry": sub_geometry is not None
+                            })
+                        else:
+                            break  # Нет больше кварталов в этой зоне
+                    except:
+                        break
+                    
+                    time.sleep(0.1)
+            else:
+                empty_zones += 1
+        except:
+            empty_zones += 1
+        
+        time.sleep(0.15)  # Пауза между запросами
+    
+    return {
+        "success": True,
+        "district": district_cn,
+        "quarters": found_quarters,
+        "count": len(found_quarters),
+        "scanned": scanned,
+        "note": f"Просканировано {scanned} номеров, найдено {len(found_quarters)} кварталов"
+    }
 
 
 # === ФУНКЦИЯ ПОЛУЧЕНИЯ ОБЪЕКТОВ В КВАРТАЛЕ (через перебор) ===
@@ -438,7 +467,7 @@ def get_objects_in_quarter(
         objects = []
         settlements = set()
         not_found_count = 0
-        max_not_found = 20  # Прекращаем после 20 пустых номеров подряд
+        max_not_found = 20
         current_num = offset + 1
 
         while len(objects) < limit and not_found_count < max_not_found:
@@ -474,7 +503,7 @@ def get_objects_in_quarter(
                         settlements.add(settlement)
 
                     objects.append(obj)
-                    not_found_count = 0  # Сбрасываем счётчик
+                    not_found_count = 0
                 else:
                     not_found_count += 1
 
@@ -482,8 +511,6 @@ def get_objects_in_quarter(
                 not_found_count += 1
 
             current_num += 1
-
-            # Небольшая пауза для предотвращения блокировки
             time.sleep(0.1)
 
         return {
@@ -608,7 +635,7 @@ async def root():
     return {
         "status": "ok",
         "service": "rosreestr2coord-api",
-        "version": "3.2.0",
+        "version": "3.2.1",
         "features": [
             "Полная информация об объектах недвижимости",
             "Все типы объектов НСПД (1, 2, 4, 5, 7, 15)",
@@ -617,7 +644,7 @@ async def root():
             "Кэширование (TTL 1 час)",
             "GeoJSON координаты",
             "Список объектов в кадастровом квартале",
-            "Список кварталов в кадастровом районе"
+            "Сканирование кварталов в кадастровом районе"
         ],
         "cache_size": len(CACHE)
     }
@@ -709,46 +736,48 @@ async def get_cadastral_oks(
     }
 
 
-# === ЭНДПОИНТЫ: Список кварталов в районе ===
-@app.get("/api/district/{district_cn}/quarters")
-async def get_district_quarters(
+# === ЭНДПОИНТЫ: Сканирование кварталов в районе ===
+@app.get("/api/district/{district_cn}/quarters/scan")
+async def scan_district_quarters(
     district_cn: str,
-    limit: int = Query(100, description="Максимальное количество кварталов"),
+    max_quarters: int = Query(100, description="Максимальное количество кварталов"),
     authorization: Optional[str] = Header(None)
 ):
     """
-    Получить список кадастровых кварталов в районе
-
+    Сканировать кварталы в кадастровом районе
+    
     - **district_cn**: Кадастровый номер района (например: 12:05)
-    - **limit**: Максимальное количество кварталов (по умолчанию 100)
-
-    Использует PKK API Росреестра для получения списка кварталов.
+    - **max_quarters**: Максимальное количество кварталов (по умолчанию 100)
+    
+    Сканирует кварталы путём перебора возможных номеров.
+    Медленно, но надёжно работает без PKK API.
     """
     verify_token(authorization)
-    return get_quarters_in_district(district_cn, limit)
+    return scan_quarters_in_district(district_cn, max_quarters)
 
 
 @app.get("/api/district/{district_cn}/quarters/boundaries")
 async def get_district_quarters_boundaries(
     district_cn: str,
-    limit: int = Query(50, description="Максимальное количество кварталов"),
+    max_quarters: int = Query(50, description="Максимальное количество кварталов"),
     authorization: Optional[str] = Header(None)
 ):
     """
     Получить список кварталов района с их границами (GeoJSON)
-
-    Медленнее, но возвращает полную геометрию каждого квартала.
+    
+    Сначала сканирует кварталы, затем получает границы каждого.
+    Медленно, но возвращает полную геометрию.
     """
     verify_token(authorization)
-
-    # Сначала получаем список кварталов
-    quarters_result = get_quarters_in_district(district_cn, limit)
-
-    if not quarters_result.get("success"):
-        return quarters_result
-
-    quarters = quarters_result.get("quarters", [])
-
+    
+    # Сначала сканируем кварталы
+    scan_result = scan_quarters_in_district(district_cn, max_quarters)
+    
+    if not scan_result.get("success"):
+        return scan_result
+    
+    quarters = scan_result.get("quarters", [])
+    
     if not quarters:
         return {
             "success": True,
@@ -756,7 +785,7 @@ async def get_district_quarters_boundaries(
             "features": [],
             "count": 0
         }
-
+    
     # Получаем границы для каждого квартала
     features = []
     for q in quarters:
@@ -765,8 +794,8 @@ async def get_district_quarters_boundaries(
             result = get_area_data(cn, area_type=2, center_only=False, use_cache=True)
             if result.get("success") and result.get("geojson"):
                 features.append(result["geojson"])
-            time.sleep(0.2)  # Пауза между запросами
-
+            time.sleep(0.1)
+    
     return {
         "success": True,
         "district": district_cn,
@@ -787,13 +816,6 @@ async def get_quarter_objects(
 ):
     """
     Получить список объектов в кадастровом квартале
-
-    - **quarter_cn**: Кадастровый номер квартала (например: 12:05:0201001)
-    - **object_type**: 1 = земельные участки, 5 = ОКС
-    - **limit**: Максимальное количество объектов (рекомендуется 10-30)
-    - **offset**: Начальный номер объекта для пагинации
-
-    Сканирует объекты последовательно по номерам. Медленнее, но надёжнее.
     """
     verify_token(authorization)
     return get_objects_in_quarter(quarter_cn, object_type, limit, offset)
@@ -808,14 +830,10 @@ async def get_quarter_settlements(
     Получить список населённых пунктов в кадастровом квартале
     """
     verify_token(authorization)
-
     result = get_objects_in_quarter(quarter_cn, object_type=1, limit=30)
-
     if not result.get("success"):
         return result
-
     settlements = result.get("settlements", [])
-
     return {
         "success": True,
         "quarter": quarter_cn,
