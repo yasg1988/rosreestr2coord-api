@@ -1,7 +1,7 @@
 """
-Rosreestr2Coord API Server v3.0.1
+Rosreestr2Coord API Server v3.1.0
 Полная информация о земельных участках и ОКС по кадастровому номеру
-Все функции библиотеки rosreestr2coord
++ Список объектов в кадастровом квартале
 """
 
 from fastapi import FastAPI, HTTPException, Header, Query, Response
@@ -15,13 +15,15 @@ import hashlib
 import json
 import os
 import time
+import requests
+import re
 
 from rosreestr2coord.parser import Area
 
 app = FastAPI(
     title="Rosreestr2Coord API",
     description="API для получения полной информации об объектах недвижимости по кадастровому номеру",
-    version="3.0.1"
+    version="3.1.0"
 )
 
 # CORS
@@ -35,6 +37,9 @@ app.add_middleware(
 
 # Авторизация
 API_TOKEN = os.environ.get("API_TOKEN", "rr2c_api_7f8a9b3c4d5e6f")
+
+# ПКК API URL
+PKK_API_URL = "https://pkk.rosreestr.ru/api/features"
 
 # Типы объектов в НСПД (обновлённые)
 AREA_TYPES = {
@@ -159,9 +164,9 @@ def extract_center(geometry: dict) -> Optional[Dict[str, float]]:
     coords = geometry.get("coordinates", [])
     if not coords:
         return None
-    
+
     geo_type = geometry.get("type", "")
-    
+
     if geo_type == "Point":
         return {"lon": coords[0], "lat": coords[1]}
     elif geo_type == "Polygon" and coords:
@@ -274,7 +279,7 @@ def geometry_to_kml(geometry: dict, name: str = "", description: str = "") -> st
     """Конвертирует GeoJSON геометрию в KML"""
     geo_type = geometry.get("type", "")
     coords = geometry.get("coordinates", [])
-    
+
     kml_parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<kml xmlns="http://www.opengis.net/kml/2.2">',
@@ -284,7 +289,7 @@ def geometry_to_kml(geometry: dict, name: str = "", description: str = "") -> st
         '<Placemark>',
         f'<name>{name}</name>'
     ]
-    
+
     if geo_type == "Point":
         kml_parts.append(f'<Point><coordinates>{coords[0]},{coords[1]},0</coordinates></Point>')
     elif geo_type == "Polygon":
@@ -300,9 +305,153 @@ def geometry_to_kml(geometry: dict, name: str = "", description: str = "") -> st
             kml_parts.append(coord_str)
             kml_parts.append('</coordinates></LinearRing></outerBoundaryIs></Polygon>')
         kml_parts.append('</MultiGeometry>')
-    
+
     kml_parts.extend(['</Placemark>', '</Document>', '</kml>'])
     return '\n'.join(kml_parts)
+
+
+def is_cadastral_quarter(cn: str) -> bool:
+    """Проверяет, является ли номер кадастровым кварталом (без номера участка)"""
+    # Формат квартала: XX:XX:XXXXXXX (без :XXX в конце)
+    pattern = r'^\d{2}:\d{2}:\d{6,7}$'
+    return bool(re.match(pattern, cn))
+
+
+def extract_settlement_from_address(address: str) -> Optional[str]:
+    """Извлекает название населённого пункта из адреса"""
+    if not address:
+        return None
+
+    # Паттерны для извлечения НП
+    patterns = [
+        r'(?:г\.|город)\s*([^,]+)',  # г. Йошкар-Ола
+        r'(?:д\.|деревня)\s*([^,]+)',  # д. Апшакбеляк
+        r'(?:с\.|село)\s*([^,]+)',  # с. Семёновка
+        r'(?:п\.|посёлок|пос\.)\s*([^,]+)',  # п. Медведево
+        r'(?:пгт|пгт\.)\s*([^,]+)',  # пгт Советский
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, address, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+    return None
+
+
+# === ФУНКЦИЯ ПОЛУЧЕНИЯ ОБЪЕКТОВ В КВАРТАЛЕ ===
+def get_objects_in_quarter(
+    quarter_cn: str,
+    object_type: int = 1,  # 1=ЗУ, 5=ОКС
+    limit: int = 100,
+    offset: int = 0
+) -> dict:
+    """
+    Получает список объектов в кадастровом квартале через ПКК API
+
+    Args:
+        quarter_cn: Кадастровый номер квартала (например: 12:05:0201001)
+        object_type: Тип объектов (1=земельные участки, 5=ОКС)
+        limit: Максимальное количество объектов
+        offset: Смещение для пагинации
+
+    Returns:
+        Словарь с результатами поиска
+    """
+
+    # Проверяем формат
+    if not is_cadastral_quarter(quarter_cn):
+        return {
+            "success": False,
+            "error": f"Неверный формат кадастрового квартала: {quarter_cn}. Ожидается формат XX:XX:XXXXXXX"
+        }
+
+    try:
+        # Запрос к ПКК API
+        url = f"{PKK_API_URL}/{object_type}"
+        params = {
+            "text": quarter_cn,
+            "limit": min(limit, 100),  # ПКК ограничивает 100
+            "skip": offset,
+            "tolerance": 4
+        }
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://pkk.rosreestr.ru/"
+        }
+
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        features = data.get("features", [])
+        total = data.get("total", len(features))
+
+        # Обрабатываем результаты
+        objects = []
+        settlements = set()
+
+        for feature in features:
+            attrs = feature.get("attrs", {})
+            cn = attrs.get("cn", "")
+            address = attrs.get("address", "")
+
+            # Проверяем, что объект принадлежит запрашиваемому кварталу
+            if not cn.startswith(quarter_cn):
+                continue
+
+            obj = {
+                "cn": cn,
+                "address": address,
+                "area": attrs.get("area_value"),
+                "cost": attrs.get("cad_cost"),
+                "category": attrs.get("category_type"),
+                "permitted_use": attrs.get("util_by_doc"),
+                "status": attrs.get("statecd"),
+                "has_geometry": feature.get("center") is not None
+            }
+
+            # Извлекаем НП из адреса
+            settlement = extract_settlement_from_address(address)
+            if settlement:
+                obj["settlement"] = settlement
+                settlements.add(settlement)
+
+            objects.append(obj)
+
+        return {
+            "success": True,
+            "quarter": quarter_cn,
+            "object_type": object_type,
+            "object_type_name": "Земельные участки" if object_type == 1 else "Объекты капитального строительства",
+            "total": total,
+            "returned": len(objects),
+            "offset": offset,
+            "limit": limit,
+            "settlements": list(settlements),
+            "objects": objects
+        }
+
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "quarter": quarter_cn,
+            "error": "Timeout: ПКК API не ответил вовремя"
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "success": False,
+            "quarter": quarter_cn,
+            "error": f"Ошибка запроса к ПКК: {str(e)}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "quarter": quarter_cn,
+            "error": str(e)
+        }
 
 
 # === ОСНОВНЫЕ ФУНКЦИИ ===
@@ -314,7 +463,7 @@ def get_area_data(
     use_cache: bool = True
 ) -> dict:
     """Получить данные об участке"""
-    
+
     # Проверяем кэш
     if use_cache:
         cache_key = get_cache_key(cadastral_number, area_type, center_only)
@@ -322,7 +471,7 @@ def get_area_data(
         if cached:
             cached["from_cache"] = True
             return cached
-    
+
     try:
         # Вызываем Area без center_only - библиотека его не поддерживает
         # center_only используется только для фильтрации возвращаемых данных
@@ -411,14 +560,15 @@ async def root():
     return {
         "status": "ok",
         "service": "rosreestr2coord-api",
-        "version": "3.0.1",
+        "version": "3.1.0",
         "features": [
             "Полная информация об объектах недвижимости",
             "Все типы объектов НСПД (1, 2, 4, 5, 7, 15)",
             "center_only - только центры участков",
             "KML экспорт",
             "Кэширование (TTL 1 час)",
-            "GeoJSON координаты"
+            "GeoJSON координаты",
+            "Список объектов в кадастровом квартале (NEW!)"
         ],
         "cache_size": len(CACHE)
     }
@@ -482,14 +632,14 @@ async def get_cadastral_kml(
     """Экспорт в KML формат"""
     verify_token(authorization)
     result = get_area_data(cadastral_number, area_type, center_only=False)
-    
+
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error", "Not found"))
-    
+
     geometry = result.get("geometry", {})
     name = result.get("data", {}).get("cadastral_number", cadastral_number)
     address = result.get("data", {}).get("address", "")
-    
+
     kml = geometry_to_kml(geometry, name, address)
     return Response(content=kml, media_type="application/vnd.google-earth.kml+xml")
 
@@ -510,6 +660,59 @@ async def get_cadastral_oks(
     }
 
 
+# === НОВЫЙ ЭНДПОИНТ: Список объектов в квартале ===
+@app.get("/api/quarter/{quarter_cn}/objects")
+async def get_quarter_objects(
+    quarter_cn: str,
+    object_type: int = Query(1, description="Тип объектов: 1=ЗУ, 5=ОКС"),
+    limit: int = Query(100, description="Максимальное количество (до 100)"),
+    offset: int = Query(0, description="Смещение для пагинации"),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Получить список объектов в кадастровом квартале
+
+    - **quarter_cn**: Кадастровый номер квартала (например: 12:05:0201001)
+    - **object_type**: 1 = земельные участки, 5 = объекты капитального строительства
+    - **limit**: Максимальное количество объектов (до 100)
+    - **offset**: Смещение для пагинации
+
+    Возвращает список объектов с кадастровыми номерами, адресами и характеристиками.
+    Также извлекает названия населённых пунктов из адресов.
+    """
+    verify_token(authorization)
+    return get_objects_in_quarter(quarter_cn, object_type, limit, offset)
+
+
+@app.get("/api/quarter/{quarter_cn}/settlements")
+async def get_quarter_settlements(
+    quarter_cn: str,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Получить список населённых пунктов в кадастровом квартале
+
+    Анализирует адреса объектов и извлекает уникальные названия НП.
+    """
+    verify_token(authorization)
+
+    # Получаем объекты (земельные участки)
+    result = get_objects_in_quarter(quarter_cn, object_type=1, limit=100)
+
+    if not result.get("success"):
+        return result
+
+    settlements = result.get("settlements", [])
+
+    return {
+        "success": True,
+        "quarter": quarter_cn,
+        "settlements": settlements,
+        "count": len(settlements),
+        "analyzed_objects": result.get("returned", 0)
+    }
+
+
 @app.post("/api/cadastral")
 async def post_cadastral(request: CadastralRequest, authorization: Optional[str] = Header(None)):
     """Получить информацию по кадастровому номеру (POST)"""
@@ -525,7 +728,7 @@ async def batch_cadastral(request: BatchRequest, authorization: Optional[str] = 
         get_area_data(cn, request.area_type, center_only=request.center_only)
         for cn in request.cadastral_numbers
     ]
-    
+
     if request.center_only:
         # Для center_only возвращаем упрощённый формат
         centers = [
@@ -552,31 +755,31 @@ async def batch_kml(request: BatchRequest, authorization: Optional[str] = Header
     """Пакетный экспорт в KML"""
     verify_token(authorization)
     results = [get_area_data(cn, request.area_type) for cn in request.cadastral_numbers]
-    
+
     kml_parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<kml xmlns="http://www.opengis.net/kml/2.2">',
         '<Document>',
         '<name>Кадастровые объекты</name>'
     ]
-    
+
     for r in results:
         if r.get("success") and r.get("geometry"):
             name = r.get("data", {}).get("cadastral_number", "")
             geo = r.get("geometry", {})
             geo_type = geo.get("type", "")
             coords = geo.get("coordinates", [])
-            
+
             kml_parts.append(f'<Placemark><name>{name}</name>')
-            
+
             if geo_type == "Polygon" and coords:
                 kml_parts.append('<Polygon><outerBoundaryIs><LinearRing><coordinates>')
                 coord_str = ' '.join([f'{p[0]},{p[1]},0' for p in coords[0]])
                 kml_parts.append(coord_str)
                 kml_parts.append('</coordinates></LinearRing></outerBoundaryIs></Polygon>')
-            
+
             kml_parts.append('</Placemark>')
-    
+
     kml_parts.extend(['</Document>', '</kml>'])
     return Response(content='\n'.join(kml_parts), media_type="application/vnd.google-earth.kml+xml")
 
