@@ -1,5 +1,5 @@
 """
-Rosreestr2Coord API Server v3.0
+Rosreestr2Coord API Server v3.0.1
 Полная информация о земельных участках и ОКС по кадастровому номеру
 Все функции библиотеки rosreestr2coord
 """
@@ -21,7 +21,7 @@ from rosreestr2coord.parser import Area
 app = FastAPI(
     title="Rosreestr2Coord API",
     description="API для получения полной информации об объектах недвижимости по кадастровому номеру",
-    version="3.0.0"
+    version="3.0.1"
 )
 
 # CORS
@@ -324,12 +324,13 @@ def get_area_data(
             return cached
     
     try:
+        # Вызываем Area без center_only - библиотека его не поддерживает
+        # center_only используется только для фильтрации возвращаемых данных
         area = Area(
             code=cadastral_number,
             area_type=area_type,
             with_log=False,
-            timeout=30,
-            center_only=center_only
+            timeout=30
         )
 
         if area.feature:
@@ -342,7 +343,7 @@ def get_area_data(
                 "address": options.get("address") or options.get("readable_address", "")
             }
 
-            # Центр
+            # Центр - извлекаем из геометрии или из properties
             center = extract_center(geometry) or properties.get("center", {})
 
             result = {
@@ -410,7 +411,7 @@ async def root():
     return {
         "status": "ok",
         "service": "rosreestr2coord-api",
-        "version": "3.0.0",
+        "version": "3.0.1",
         "features": [
             "Полная информация об объектах недвижимости",
             "Все типы объектов НСПД (1, 2, 4, 5, 7, 15)",
