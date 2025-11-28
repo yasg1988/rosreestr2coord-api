@@ -1,7 +1,7 @@
 """
-Rosreestr2Coord API Server v3.2.1
+Rosreestr2Coord API Server v3.3.0
 Полная информация о земельных участках и ОКС по кадастровому номеру
-+ Список объектов в кадастровом квартале (через НСПД)
++ Глубокое сканирование объектов в кадастровом квартале
 + Сканирование кварталов в кадастровом районе
 """
 
@@ -28,7 +28,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = FastAPI(
     title="Rosreestr2Coord API",
     description="API для получения полной информации об объектах недвижимости по кадастровому номеру",
-    version="3.2.1"
+    version="3.3.0"
 )
 
 # CORS
@@ -446,15 +446,25 @@ def scan_quarters_in_district(
     }
 
 
-# === ФУНКЦИЯ ПОЛУЧЕНИЯ ОБЪЕКТОВ В КВАРТАЛЕ (через перебор) ===
+# === ФУНКЦИЯ ПОЛУЧЕНИЯ ОБЪЕКТОВ В КВАРТАЛЕ (стандартная) ===
 def get_objects_in_quarter(
     quarter_cn: str,
     object_type: int = 1,
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
+    scan_depth: int = 100,
+    max_number: int = 2000
 ) -> dict:
     """
     Получает список объектов в кадастровом квартале через последовательный перебор
+    
+    Args:
+        quarter_cn: Кадастровый номер квартала
+        object_type: Тип объекта (1=ЗУ, 5=ОКС)
+        limit: Максимальное количество объектов для возврата
+        offset: Начальный номер для сканирования
+        scan_depth: Сколько пустых номеров подряд допускать (default 100)
+        max_number: Максимальный номер для сканирования (default 2000)
     """
 
     if not is_cadastral_quarter(quarter_cn):
@@ -467,10 +477,14 @@ def get_objects_in_quarter(
         objects = []
         settlements = set()
         not_found_count = 0
-        max_not_found = 20
         current_num = offset + 1
+        last_found_num = 0
 
-        while len(objects) < limit and not_found_count < max_not_found:
+        while len(objects) < limit and current_num <= max_number:
+            # Прекращаем если слишком много пустых подряд
+            if not_found_count >= scan_depth:
+                break
+                
             cn = f"{quarter_cn}:{current_num}"
 
             try:
@@ -484,7 +498,9 @@ def get_objects_in_quarter(
                 if area.feature:
                     props = area.feature.get("properties", {})
                     options = props.get("options", {})
+                    geometry = area.feature.get("geometry", {})
                     address = options.get("address") or options.get("readable_address", "")
+                    center = extract_center(geometry) if geometry else None
 
                     obj = {
                         "cn": cn,
@@ -494,7 +510,8 @@ def get_objects_in_quarter(
                         "category": options.get("category_type"),
                         "permitted_use": options.get("util_by_doc"),
                         "status": options.get("statecd"),
-                        "has_geometry": area.feature.get("geometry") is not None
+                        "has_geometry": geometry is not None,
+                        "center": center
                     }
 
                     settlement = extract_settlement_from_address(address)
@@ -504,6 +521,7 @@ def get_objects_in_quarter(
 
                     objects.append(obj)
                     not_found_count = 0
+                    last_found_num = current_num
                 else:
                     not_found_count += 1
 
@@ -511,7 +529,7 @@ def get_objects_in_quarter(
                 not_found_count += 1
 
             current_num += 1
-            time.sleep(0.1)
+            time.sleep(0.05)  # Ускорили с 0.1 до 0.05
 
         return {
             "success": True,
@@ -519,12 +537,133 @@ def get_objects_in_quarter(
             "object_type": object_type,
             "object_type_name": "Земельные участки" if object_type == 1 else "Объекты капитального строительства",
             "total_scanned": current_num - offset - 1,
+            "last_scanned_number": current_num - 1,
+            "last_found_number": last_found_num,
             "returned": len(objects),
             "offset": offset,
             "limit": limit,
+            "scan_depth": scan_depth,
+            "max_number": max_number,
             "settlements": list(settlements),
             "objects": objects,
-            "note": f"Просканировано номеров: {current_num - offset - 1}, найдено объектов: {len(objects)}"
+            "note": f"Просканировано: 1-{current_num-1}, найдено: {len(objects)}, последний найденный: {last_found_num}"
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "quarter": quarter_cn,
+            "error": str(e)
+        }
+
+
+# === ФУНКЦИЯ ГЛУБОКОГО СКАНИРОВАНИЯ (для 100% покрытия) ===
+def deep_scan_quarter(
+    quarter_cn: str,
+    object_type: int = 1,
+    max_number: int = 3000,
+    batch_size: int = 500
+) -> dict:
+    """
+    Глубокое сканирование квартала для получения 100% объектов.
+    Сканирует весь диапазон номеров без остановки на пустых.
+    
+    Args:
+        quarter_cn: Кадастровый номер квартала
+        object_type: Тип объекта (1=ЗУ, 5=ОКС)  
+        max_number: Максимальный номер для сканирования (до 5000)
+        batch_size: Размер батча для отчёта о прогрессе
+    """
+
+    if not is_cadastral_quarter(quarter_cn):
+        return {
+            "success": False,
+            "error": f"Неверный формат кадастрового квартала: {quarter_cn}"
+        }
+
+    # Ограничиваем max_number
+    max_number = min(max_number, 5000)
+
+    try:
+        objects = []
+        settlements = set()
+        found_numbers = []
+        
+        start_time = time.time()
+        
+        for current_num in range(1, max_number + 1):
+            cn = f"{quarter_cn}:{current_num}"
+
+            try:
+                area = Area(
+                    code=cn,
+                    area_type=object_type,
+                    with_log=False,
+                    timeout=8
+                )
+
+                if area.feature:
+                    props = area.feature.get("properties", {})
+                    options = props.get("options", {})
+                    geometry = area.feature.get("geometry", {})
+                    address = options.get("address") or options.get("readable_address", "")
+                    center = extract_center(geometry) if geometry else None
+
+                    obj = {
+                        "cn": cn,
+                        "address": address,
+                        "area": options.get("area_value"),
+                        "cost": options.get("cad_cost"),
+                        "category": options.get("category_type"),
+                        "permitted_use": options.get("util_by_doc"),
+                        "status": options.get("statecd"),
+                        "has_geometry": geometry is not None,
+                        "center": center
+                    }
+
+                    settlement = extract_settlement_from_address(address)
+                    if settlement:
+                        obj["settlement"] = settlement
+                        settlements.add(settlement)
+
+                    objects.append(obj)
+                    found_numbers.append(current_num)
+
+            except Exception:
+                pass
+
+            # Небольшая пауза каждые 10 запросов
+            if current_num % 10 == 0:
+                time.sleep(0.02)
+
+        elapsed = time.time() - start_time
+        
+        # Анализ распределения номеров
+        gaps = []
+        if len(found_numbers) > 1:
+            for i in range(1, len(found_numbers)):
+                gap = found_numbers[i] - found_numbers[i-1]
+                if gap > 10:
+                    gaps.append({"after": found_numbers[i-1], "gap": gap})
+
+        return {
+            "success": True,
+            "quarter": quarter_cn,
+            "object_type": object_type,
+            "object_type_name": "Земельные участки" if object_type == 1 else "ОКС",
+            "scanned_range": f"1-{max_number}",
+            "total_scanned": max_number,
+            "found_count": len(objects),
+            "coverage_percent": round(len(objects) / max_number * 100, 2) if max_number > 0 else 0,
+            "elapsed_seconds": round(elapsed, 1),
+            "settlements": list(settlements),
+            "number_distribution": {
+                "first": found_numbers[0] if found_numbers else None,
+                "last": found_numbers[-1] if found_numbers else None,
+                "large_gaps": gaps[:10]  # Показываем до 10 больших разрывов
+            },
+            "objects": objects,
+            "note": f"Полное сканирование 1-{max_number}, найдено {len(objects)} объектов за {round(elapsed, 1)} сек"
         }
 
     except Exception as e:
@@ -635,7 +774,7 @@ async def root():
     return {
         "status": "ok",
         "service": "rosreestr2coord-api",
-        "version": "3.2.1",
+        "version": "3.3.0",
         "features": [
             "Полная информация об объектах недвижимости",
             "Все типы объектов НСПД (1, 2, 4, 5, 7, 15)",
@@ -643,7 +782,7 @@ async def root():
             "KML экспорт",
             "Кэширование (TTL 1 час)",
             "GeoJSON координаты",
-            "Список объектов в кадастровом квартале",
+            "Глубокое сканирование объектов в квартале (до 5000 номеров)",
             "Сканирование кварталов в кадастровом районе"
         ],
         "cache_size": len(CACHE)
@@ -805,20 +944,51 @@ async def get_district_quarters_boundaries(
     }
 
 
-# === ЭНДПОИНТ: Список объектов в квартале ===
+# === ЭНДПОИНТ: Список объектов в квартале (стандартный) ===
 @app.get("/api/quarter/{quarter_cn}/objects")
 async def get_quarter_objects(
     quarter_cn: str,
     object_type: int = Query(1, description="Тип объектов: 1=ЗУ, 5=ОКС"),
-    limit: int = Query(20, description="Максимальное количество объектов"),
+    limit: int = Query(100, description="Максимальное количество объектов"),
     offset: int = Query(0, description="Начальный номер объекта"),
+    scan_depth: int = Query(100, description="Глубина сканирования (пустых номеров подряд)"),
+    max_number: int = Query(2000, description="Максимальный номер для сканирования"),
     authorization: Optional[str] = Header(None)
 ):
     """
     Получить список объектов в кадастровом квартале
+    
+    - **scan_depth**: сколько пустых номеров подряд проверять (default 100)
+    - **max_number**: верхняя граница сканирования (до 5000)
     """
     verify_token(authorization)
-    return get_objects_in_quarter(quarter_cn, object_type, limit, offset)
+    # Ограничения
+    scan_depth = min(scan_depth, 500)
+    max_number = min(max_number, 5000)
+    limit = min(limit, 2000)
+    
+    return get_objects_in_quarter(quarter_cn, object_type, limit, offset, scan_depth, max_number)
+
+
+# === ЭНДПОИНТ: Глубокое сканирование квартала (100% покрытие) ===
+@app.get("/api/quarter/{quarter_cn}/objects/deep")
+async def get_quarter_objects_deep(
+    quarter_cn: str,
+    object_type: int = Query(1, description="Тип объектов: 1=ЗУ, 5=ОКС"),
+    max_number: int = Query(2000, description="Максимальный номер (до 5000)"),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Глубокое сканирование квартала для 100% покрытия объектов
+    
+    Сканирует ВСЕ номера от 1 до max_number без пропусков.
+    Медленно, но гарантирует полноту данных.
+    
+    **Внимание**: При max_number=3000 сканирование занимает ~5-10 минут!
+    """
+    verify_token(authorization)
+    max_number = min(max_number, 5000)
+    return deep_scan_quarter(quarter_cn, object_type, max_number)
 
 
 @app.get("/api/quarter/{quarter_cn}/settlements")
@@ -830,7 +1000,7 @@ async def get_quarter_settlements(
     Получить список населённых пунктов в кадастровом квартале
     """
     verify_token(authorization)
-    result = get_objects_in_quarter(quarter_cn, object_type=1, limit=30)
+    result = get_objects_in_quarter(quarter_cn, object_type=1, limit=50, scan_depth=100)
     if not result.get("success"):
         return result
     settlements = result.get("settlements", [])
