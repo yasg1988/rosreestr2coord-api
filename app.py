@@ -1,5 +1,5 @@
 """
-Rosreestr2Coord API Server v3.3.0
+Rosreestr2Coord API Server v3.3.1
 Полная информация о земельных участках и ОКС по кадастровому номеру
 + Глубокое сканирование объектов в кадастровом квартале
 + Сканирование кварталов в кадастровом районе
@@ -19,6 +19,7 @@ import time
 import requests
 import re
 import urllib3
+import socket
 
 from rosreestr2coord.parser import Area
 
@@ -28,7 +29,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = FastAPI(
     title="Rosreestr2Coord API",
     description="API для получения полной информации об объектах недвижимости по кадастровому номеру",
-    version="3.3.0"
+    version="3.3.1"
 )
 
 # CORS
@@ -774,7 +775,7 @@ async def root():
     return {
         "status": "ok",
         "service": "rosreestr2coord-api",
-        "version": "3.3.0",
+        "version": "3.3.1",
         "features": [
             "Полная информация об объектах недвижимости",
             "Все типы объектов НСПД (1, 2, 4, 5, 7, 15)",
@@ -783,7 +784,8 @@ async def root():
             "Кэширование (TTL 1 час)",
             "GeoJSON координаты",
             "Глубокое сканирование объектов в квартале (до 5000 номеров)",
-            "Сканирование кварталов в кадастровом районе"
+            "Сканирование кварталов в кадастровом районе",
+            "Проверка исходящего IP (/api/outbound-ip)"
         ],
         "cache_size": len(CACHE)
     }
@@ -792,6 +794,54 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "cache_entries": len(CACHE)}
+
+
+@app.get("/api/outbound-ip")
+async def get_outbound_ip(authorization: Optional[str] = Header(None)):
+    """
+    Проверить исходящий IP адрес сервера.
+    Полезно для диагностики блокировок Росреестра.
+    """
+    verify_token(authorization)
+    
+    result = {
+        "success": True,
+        "hostname": socket.gethostname(),
+        "local_ips": [],
+        "outbound_ip": None,
+        "outbound_ip_services": {}
+    }
+    
+    # Получаем локальные IP
+    try:
+        result["local_ips"] = socket.gethostbyname_ex(socket.gethostname())[2]
+    except:
+        pass
+    
+    # Проверяем исходящий IP через несколько сервисов
+    ip_services = [
+        ("ipify", "https://api.ipify.org?format=json", "ip"),
+        ("ipinfo", "https://ipinfo.io/json", "ip"),
+        ("httpbin", "https://httpbin.org/ip", "origin"),
+    ]
+    
+    for name, url, key in ip_services:
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                ip = data.get(key, "").split(",")[0].strip()  # httpbin может вернуть несколько IP
+                result["outbound_ip_services"][name] = ip
+                if not result["outbound_ip"]:
+                    result["outbound_ip"] = ip
+        except Exception as e:
+            result["outbound_ip_services"][name] = f"error: {str(e)}"
+    
+    # Добавляем информацию о том, заблокирован ли IP
+    if result["outbound_ip"]:
+        result["note"] = f"Исходящий IP: {result['outbound_ip']}. Если Росреестр блокирует (403), нужно сменить этот IP."
+    
+    return result
 
 
 @app.get("/api/types")
